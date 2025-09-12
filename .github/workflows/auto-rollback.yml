@@ -1,0 +1,173 @@
+name: Auto-Rollback Deploy
+
+# Allow manual runs and passing environment/strategy
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment (e.g., staging, production)'
+        required: true
+        default: 'staging'
+      rollback_strategy:
+        description: 'Rollback strategy: docker | git'
+        required: false
+        default: 'docker'
+
+# We need write permissions for pushing the stable tag and (optionally) package pushes
+permissions:
+  contents: write    # to create/update stable tags
+  packages: write    # if pushing to GHCR / packages
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    # make inputs available in steps as env
+    env:
+      ENVIRONMENT: ${{ github.event.inputs.environment }}
+      ROLLBACK_STRATEGY: ${{ github.event.inputs.rollback_strategy }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Prepare log
+        run: |
+          LOG=/tmp/deploy_and_rollback.log
+          echo "=== Deploy run ${{ github.run_id }} started at $(date) ===" > $LOG
+          echo "Environment: $ENVIRONMENT" >> $LOG
+          echo "Rollback strategy: $ROLLBACK_STRATEGY" >> $LOG
+        shell: bash
+
+      # ---------- USER: build step ----------
+      - name: Build
+        run: |
+          LOG=/tmp/deploy_and_rollback.log
+          echo "=== BUILD START === at $(date)" >> $LOG
+          # Replace below with your real build command(s)
+          ./scripts/build.sh >> $LOG 2>&1
+        shell: bash
+
+      # ---------- USER: test step ----------
+      - name: Test
+        run: |
+          LOG=/tmp/deploy_and_rollback.log
+          echo "=== TEST START === at $(date)" >> $LOG
+          # Replace with your test commands
+          ./scripts/test.sh >> $LOG 2>&1
+        shell: bash
+
+      # ---------- USER: deploy step ----------
+      - name: Deploy
+        run: |
+          LOG=/tmp/deploy_and_rollback.log
+          echo "=== DEPLOY START === to $ENVIRONMENT at $(date)" >> $LOG
+          # Replace with your deploy command(s). Example:
+          ./scripts/deploy.sh $ENVIRONMENT >> $LOG 2>&1
+          echo "Deploy step finished (exit code $?)" >> $LOG
+        shell: bash
+
+      # ---------- Mark the current commit / image as stable if everything succeeded ----------
+      - name: Mark current commit (and image) as stable
+        if: ${{ success() }}
+        env:
+          DOCKER_REGISTRY: ${{ secrets.DOCKER_REGISTRY }}        # e.g. ghcr.io or registry.hub.docker.com
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          LOG=/tmp/deploy_and_rollback.log
+          echo "=== MARK STABLE: starting at $(date)" >> $LOG
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          TAG=stable-${ENVIRONMENT}
+          echo "Tagging $GITHUB_SHA as $TAG" >> $LOG
+          git tag -f $TAG $GITHUB_SHA
+          git push -f origin $TAG >> $LOG 2>&1
+
+          # If you use Docker images for deployment, also tag/push a stable image:
+          if [ "${ROLLBACK_STRATEGY}" = "docker" ]; then
+            echo "Tagging & pushing docker image as ${DOCKER_REGISTRY}/myorg/myapp:${TAG}" >> $LOG
+            echo $DOCKER_PASSWORD | docker login --username $DOCKER_USERNAME --password-stdin $DOCKER_REGISTRY >> $LOG 2>&1
+            docker tag myorg/myapp:${GITHUB_SHA} ${DOCKER_REGISTRY}/myorg/myapp:${TAG} >> $LOG 2>&1
+            docker push ${DOCKER_REGISTRY}/myorg/myapp:${TAG} >> $LOG 2>&1
+          fi
+
+          echo "=== MARK STABLE: finished at $(date)" >> $LOG
+        shell: bash
+
+      # ---------- ROLLBACK: runs automatically if any previous step failed ----------
+      - name: Rollback (runs automatically on failure)
+        if: ${{ failure() }}
+        env:
+          # set secrets used for rollback (add these in repo Settings -> Secrets)
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          DOCKER_REGISTRY: ${{ secrets.DOCKER_REGISTRY }}
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          LOG=/tmp/deploy_and_rollback.log
+          echo "=== ROLLBACK START at $(date) ===" >> $LOG
+          echo "Environment: $ENVIRONMENT" >> $LOG
+          echo "Rollback strategy: $ROLLBACK_STRATEGY" >> $LOG
+          echo "" >> $LOG
+          echo "Previous logs (so far):" >> $LOG
+          tail -n +1 $LOG || true
+          echo "" >> $LOG
+
+          # Strategy: docker - pull 'stable-<env>' image and restart containers on server
+          if [ "${ROLLBACK_STRATEGY}" = "docker" ]; then
+            IMAGE=${DOCKER_REGISTRY}/myorg/myapp:stable-${ENVIRONMENT}
+            echo "Docker rollback: pulling $IMAGE" >> $LOG
+            echo "$DOCKER_PASSWORD" | docker login --username "$DOCKER_USERNAME" --password-stdin $DOCKER_REGISTRY >> $LOG 2>&1 || { echo "Docker login failed" >> $LOG; cat $LOG; exit 1; }
+            docker pull $IMAGE >> $LOG 2>&1 || { echo "Failed to pull $IMAGE" >> $LOG; cat $LOG; exit 1; }
+
+            # Restart the container on the target server via ssh (example)
+            echo "Restarting container on $SSH_HOST" >> $LOG
+            mkdir -p ~/.ssh
+            echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+            chmod 600 ~/.ssh/id_rsa
+            ssh -o StrictHostKeyChecking=no $SSH_USER@$SSH_HOST "docker pull $IMAGE && docker stop myapp || true && docker rm myapp || true && docker run -d --name myapp $IMAGE" >> $LOG 2>&1 || { echo "Remote restart failed" >> $LOG; cat $LOG; exit 1; }
+            echo "Docker rollback finished" >> $LOG
+
+          # Strategy: git - checkout stable-<env> tag and run deploy script for that commit
+          elif [ "${ROLLBACK_STRATEGY}" = "git" ]; then
+            TAG=stable-${ENVIRONMENT}
+            echo "Git rollback: checking out tag $TAG" >> $LOG
+            git fetch --tags >> $LOG 2>&1
+            if git rev-parse --verify $TAG >/dev/null 2>&1; then
+              git checkout $TAG >> $LOG 2>&1
+              echo "Deploying from $TAG" >> $LOG
+              # call your deploy script but tell it to deploy the checked-out commit
+              ./scripts/deploy.sh $ENVIRONMENT --from-tag >> $LOG 2>&1 || { echo "Redeploy from tag failed" >> $LOG; cat $LOG; exit 1; }
+              echo "Git rollback finished" >> $LOG
+            else
+              echo "No stable tag found: $TAG" >> $LOG
+              cat $LOG
+              exit 1
+            fi
+
+          else
+            echo "Unknown rollback strategy: ${ROLLBACK_STRATEGY}" >> $LOG
+            cat $LOG
+            exit 1
+          fi
+
+          echo "=== ROLLBACK COMPLETE at $(date) ===" >> $LOG
+          cat $LOG
+        shell: bash
+
+      # ---------- Upload logs always (success or failure) ----------
+      - name: Upload logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-logs-${{ github.run_id }}
+          path: /tmp/deploy_and_rollback.log
+

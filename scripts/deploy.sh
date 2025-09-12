@@ -6,9 +6,9 @@ ENVIRONMENT=${1:-staging}
 echo "=== DEPLOY SCRIPT START for $ENVIRONMENT ==="
 
 # Variables come from GitHub Secrets (set them in Settings → Secrets → Actions)
-DEPLOY_USER=${DEPLOY_USER:?DEPLOY_USER secret not set}
-DEPLOY_HOST=${DEPLOY_HOST:?DEPLOY_HOST secret not set}
-DEPLOY_PATH=${DEPLOY_PATH:?DEPLOY_PATH secret not set}
+DEPLOY_USER=${DEPLOY_USER:-user}
+DEPLOY_HOST=${DEPLOY_HOST:-192.168.1.155}
+DEPLOY_PATH=${DEPLOY_PATH:-/var/www/html/landmark}
 
 # Ensure build exists
 if [ ! -d "build" ]; then

@@ -31,7 +31,7 @@ jobs:
             if [ ! -d "$APP_DIR/.git" ]; then
               echo "📥 Cloning fresh repository..."
               sudo rm -rf "$APP_DIR"
-              git clone -b master ${{ secrets.REPO_URL }} "$APP_DIR"
+              git clone -b main ${{ secrets.REPO_URL }} "$APP_DIR"
             fi
  
             cd "$APP_DIR"

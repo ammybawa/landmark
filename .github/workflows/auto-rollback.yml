@@ -3,7 +3,7 @@ name: Deploy MyApp
 on:
   push:
     branches:
-      - master   # ✅ use master instead of main
+      - main   # ✅ use master instead of main
  
 jobs:
   deploy:
